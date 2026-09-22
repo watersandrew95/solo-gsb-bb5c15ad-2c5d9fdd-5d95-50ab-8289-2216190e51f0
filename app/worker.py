@@ -35,13 +35,19 @@ def _run(task_id: int) -> None:
             except Exception:  # noqa: BLE001 - 溯源补充失败不应掩盖原异常
                 pass
         # 题目曝光配额：仅启用配额且组卷可行的任务参与扣减；
-        # 无解/失败任务不消耗任何配额（改卷任务不声明 use_quota，天然跳过）
+        # 无解/失败任务不消耗任何配额（改卷任务不声明 use_quota，天然跳过）。
+        # 带租约的配额任务在无解/失败时把租约同事务作废（void_lease=True），
+        # 成功/配额不足的租约流转在 finish_task_with_quota 内与扣减同事务完成。
         if req.get("use_quota") and result.get("status") == "feasible":
             database.finish_task_with_quota(
                 task_id, result, quota_requirements(result)
             )
         else:
-            database.finish_task(task_id, json.dumps(result, ensure_ascii=False))
+            database.finish_task(
+                task_id,
+                json.dumps(result, ensure_ascii=False),
+                void_lease=bool(req.get("use_quota") and req.get("lease_seconds")),
+            )
 
 
 def submit(task_id: int) -> None:

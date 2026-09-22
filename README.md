@@ -12,7 +12,7 @@
 
 还提供**可版本化的组卷模板**（`POST /api/templates`）：把题库无关的约束配置（总分、题型数量、知识点覆盖、难度区间、互斥题组、多卷/候选参数）保存为**创建后不可修改**的模板；用 `POST /api/templates/{template_id}/tasks` 以新的题库快照实例化组卷任务时，可通过白名单 `overrides` 覆盖部分约束，**实际生效配置与 `template_id`/`version` 一并冻结进任务记录**，详见下文[组卷模板](#组卷模板可版本化)。
 
-另提供**题目曝光配额**模块（`PUT /api/quotas`）：按题号设置可用次数；创建任务时声明 `use_quota: true` 后，任务完成可行组卷即在 **SQLite 事务中按题号原子扣减**——并发任务串行化校验，任一题余额不足则整组不扣减、任务返回 `quota_exceeded` 及缺额明细；失败或无解任务不消耗配额，详见下文[题目曝光配额](#题目曝光配额use_quota)。
+另提供**题目曝光配额**模块（`PUT /api/quotas`）：按题号设置可用次数；创建任务时声明 `use_quota: true` 后，任务完成可行组卷即在 **SQLite 事务中按题号原子扣减**——并发任务串行化校验，任一题余额不足则整组不扣减、任务返回 `quota_exceeded` 及缺额明细；失败或无解任务不消耗配额。可在创建时附 `lease_seconds` 为本次预留建立**可过期的预留租约**：创建即下发一次性 `reservation_token`，任务完成后可在到期前凭 token **主动确认**；逾期未确认的预留由 `POST /api/quotas/reclaim-expired` 在 **SQLite 事务中原子释放（配额按题返还）并标记过期**，重复确认、过期后确认与并发回收均幂等，同一配额不会释放两次，详见下文[预留租约](#预留租约lease_seconds)。
 
 每个异步任务还附带一条**防篡改审计链**（`GET /api/tasks/{task_id}/audit`）：任务创建、开始、完成或失败、配额结算均在**对应业务写入的同一 SQLite 事务内**追加哈希链接事件（规范化 JSON + SHA-256，含前驱哈希）；接口重放整条链并与任务/配额业务表交叉校验，发现序号、前驱哈希或内容摘要异常时返回**首个断点**，绝不伪报通过，详见下文[防篡改审计链](#防篡改审计链)。
 
@@ -26,7 +26,7 @@
 docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations 与 task_audit_events 表），无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases 与 task_audit_events 表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -57,6 +57,8 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/templates/{template_id}/tasks` | 用模板 + 新题库快照实例化组卷任务（异步，支持白名单 `overrides` 与 `use_quota`） |
 | `PUT`  | `/api/quotas` | 按题号**设置**曝光配额可用次数（绝对值，存在即覆盖） |
 | `GET`  | `/api/quotas` | 查询全部题号的当前剩余可用次数 |
+| `POST` | `/api/quotas/reclaim-expired` | **回收**所有已过期且未确认的预留租约（原子释放、逐题返还；幂等） |
+| `POST` | `/api/tasks/{task_id}/quota/confirm` | 凭 reservation_token **主动确认**预留（重复/过期确认幂等） |
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。
@@ -99,6 +101,7 @@ curl -X POST http://localhost:8000/api/tasks \
 - `alternative_count`：候选卷组数量，取 `1`～`5`，缺省 `1`（单候选，响应结构与旧版完全一致）。
 - `min_question_changes`：后续候选与此前每个候选的**每张对应卷**至少不同的题目数（按对称差计），多候选时缺省 `1`；多卷任务下仅交换卷序不算新候选。
 - `use_quota`：是否启用**题目曝光配额**（缺省 `false`）；启用后任务完成可行组卷时按题号原子扣减配额，详见下文[题目曝光配额](#题目曝光配额use_quota)。
+- `lease_seconds`：配额预留租约有效期（正整数秒，缺省不设置）；仅可与 `use_quota: true` 同时给出，创建即返回一次性 `reservation_token`，详见[预留租约](#预留租约lease_seconds)。
 - `seed`：随机种子（默认 42），相同请求 + 相同种子结果可复现。
 
 ## 多卷请求示例（2～5 份平行卷）
@@ -559,7 +562,7 @@ curl -X POST http://localhost:8000/api/templates/1/tasks \
 # -> {"task_id": 57, "status": "pending", "template_id": 1, "template_version": 1}
 ```
 
-- `questions`（必填）、`seed`、`name`、`use_quota` 为实例化请求的独立字段；`name` 缺省沿用模板名称，`use_quota` 语义与 `/api/tasks` 一致（见[题目曝光配额](#题目曝光配额use_quota)）。
+- `questions`（必填）、`seed`、`name`、`use_quota`、`lease_seconds` 为实例化请求的独立字段；`name` 缺省沿用模板名称，`use_quota` / `lease_seconds` 语义与 `/api/tasks` 一致（见[题目曝光配额](#题目曝光配额use_quota)与[预留租约](#预留租约lease_seconds)）。
 - `overrides` 逐字段覆盖模板配置，**仅允许白名单字段**：`total_score`、`type_counts`、`knowledge_coverage`、`difficulty_range`、`target_difficulty`、`mutex_groups`、`paper_count`、`max_shared_questions`、`alternative_count`、`min_question_changes`；显式置 `null` 表示清除模板值、回到缺省行为（如 `"target_difficulty": null` 恢复为区间中点）。
 - 白名单之外的任何字段（未知字段、拼写错误、`questions`/`seed`/`name` 等）一律 `422`，错误明细列出全部可覆盖字段。
 - 合并后的生效配置连同题库快照按 `/api/tasks` 的同一套规则全量校验，**非法合并**（如把 `paper_count` 覆盖为 `1` 而模板带有 `max_shared_questions`、难度区间倒置、互斥组引用了快照中不存在的题号等）返回 `422` 与逐字段错误明细。
@@ -671,6 +674,92 @@ curl -X POST http://localhost:8000/api/tasks \
 ```
 
 补足配额（重新 `PUT /api/quotas`）后重新提交任务即可。
+
+### 预留租约（`lease_seconds`）
+
+默认情况下配额一旦扣减即永久生效。创建启用配额的任务时可附 `lease_seconds`（正整数秒，模板实例化任务同样支持，为实例化请求的独立字段、不可经 `overrides` 覆盖；仅可与 `use_quota: true` 同时给出，否则 `422`），为本次预留建立**可过期的租约**：
+
+- **建约即发 token**：任务创建响应立即返回一次性 `reservation_token` 与 `lease_seconds`，此时租约状态为 `awaiting`（任务尚未结算，到期时间未定）；token 仅此一次返回，查询接口不会再次暴露。
+- **结算激活**：任务可行且配额扣减成功时，租约在扣减的**同一 SQLite 事务**中激活为 `reserved`，冻结到期时间 `expires_at = 结算时刻（UTC） + lease_seconds`；任务无解/失败或配额不足（`quota_exceeded`）时租约在同事务置为 `void`（作废，不占配额）。
+- **主动确认**：任务完成后，持 token 在到期前调用 `POST /api/tasks/{task_id}/quota/confirm` 把租约置为 `confirmed`，配额转为永久扣减。
+- **过期回收**：逾期未确认的预留不会自动消失，需调用 `POST /api/quotas/reclaim-expired`：在**单个 SQLite 事务**中原子地把所有 `reserved` 且已到期的租约标记为 `reclaimed`，并按 `quota_reservations` 把次数**逐题返还**到 `quotas`（可安全反复调用，通常由定时任务周期性触发）。
+- **幂等与互斥**：确认与回收都走“状态 + 到期时间”双条件的条件更新（进程内互斥锁 + `BEGIN IMMEDIATE`），以行计数裁决——重复确认返回 `already_confirmed`、过期后确认返回 `code=expired` 且**绝不返还或重扣**、重复/并发回收只在首次返还，因此同一配额不可能被释放两次。
+
+创建请求（普通任务/模板实例化均可）：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "高三数学月考·预留待确认",
+    "questions": [ /* ……题库快照…… */ ],
+    "total_score": 20,
+    "type_counts": {"single_choice": 2, "essay": 1},
+    "difficulty_range": [0.3, 0.7],
+    "use_quota": true,
+    "lease_seconds": 3600,
+    "seed": 42
+  }'
+# -> {"task_id": 23, "status": "pending",
+#     "lease_seconds": 3600,
+#     "reservation_token": "k8Xl…（一次性，仅此返回）…"}
+```
+
+任务查询的 `quota.lease` 块实时返回租约状态与到期时间（`reserved` 但已过 `expires_at` 时报告 `expired`；实际返还仍只由回收接口完成）：
+
+```json
+{
+  "task_id": 23,
+  "status": "done",
+  "quota": {
+    "status": "reserved",
+    "reservations": [{"question_id": 1, "reserved": 1, "remaining": 1}],
+    "lease": {
+      "status": "reserved",
+      "lease_seconds": 3600,
+      "expires_at": "2026-09-22T13:00:05Z",
+      "confirmed_at": null,
+      "released_at": null
+    }
+  }
+}
+```
+
+主动确认：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/23/quota/confirm \
+  -H "Content-Type: application/json" \
+  -d '{"reservation_token": "k8Xl…"}'
+# -> {"task_id": 23, "code": "confirmed",
+#     "lease": {"status": "confirmed", "lease_seconds": 3600,
+#               "expires_at": "2026-09-22T13:00:05Z",
+#               "confirmed_at": "2026-09-22T12:05:10Z", "released_at": null}}
+```
+
+确认接口的状态码与 `code`：
+
+| 情形 | HTTP | `code` / 说明 |
+| --- | --- | --- |
+| 到期前首次确认 | `200` | `confirmed` |
+| 到期前再次确认 | `200` | `already_confirmed`（幂等） |
+| 已过期 / 已被回收 | `422` | `expired`（配额仅由回收接口返还，确认不返还、不重扣） |
+| 任务尚未结算 | `422` | `awaiting` |
+| 任务未产生预留（无解/失败/配额不足） | `422` | `void` |
+| token 错误 | `403` | — |
+| 任务不存在 / 任务无租约 | `404` | — |
+
+回收过期预留：
+
+```bash
+curl -X POST http://localhost:8000/api/quotas/reclaim-expired
+# -> {"reclaimed_count": 1, "returned_total": 1,
+#     "reclaimed": [{"task_id": 24, "question_id": 1, "returned": 1}]}
+# 再次调用（或并发调用）：
+# -> {"reclaimed_count": 0, "returned_total": 0, "reclaimed": []}
+```
+
+回收后任务查询的 `quota.lease.status` 为 `reclaimed` 且 `released_at` 为释放时刻；`GET /api/quotas` 中相应题号余额已加回本次预留次数。`quota.reservations` 与 `quota_settled` 审计事件保留扣减当时的快照不变（返还动作不改写历史）。
 
 ## 防篡改审计链
 

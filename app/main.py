@@ -16,7 +16,11 @@ from .schemas import (
     OVERRIDABLE_FIELDS,
     AuditEventOut,
     ExamTaskIn,
+    QuotaConfirmIn,
+    QuotaConfirmOut,
+    QuotaLeaseOut,
     QuotaOut,
+    QuotaReclaimOut,
     QuotaReservationOut,
     QuotaSetIn,
     ReviewPlanIn,
@@ -48,10 +52,10 @@ app = FastAPI(
         "面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），"
         "支持 2~5 份平行卷联合组卷、1~5 个差异化候选卷组，"
         "可版本化、创建后不可变的组卷模板，"
-        "按题号扣减的题目曝光配额，"
+        "按题号扣减的题目曝光配额及可过期预留租约（lease），"
         "以及面向已完成且可行任务的盲审分配"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -90,17 +94,75 @@ def list_quotas() -> List[QuotaOut]:
     return [_quota_out(r) for r in database.list_quotas()]
 
 
-@app.post("/api/tasks", response_model=TaskCreated, status_code=201)
+@app.post(
+    "/api/quotas/reclaim-expired",
+    response_model=QuotaReclaimOut,
+)
+def reclaim_expired_quotas() -> QuotaReclaimOut:
+    """回收所有**已过期且未确认**的预留租约：原子释放并标记过期。
+
+    在单个 SQLite 事务（进程内互斥锁 + BEGIN IMMEDIATE）中选出全部
+    status=reserved 且 expires_at 已过的租约，逐个按状态+到期条件抢占式置为
+    reclaimed，并按 quota_reservations 逐题把 reserved 次数返还到 quotas。
+    条件 UPDATE 的行计数是唯一裁决：已确认（confirmed）或已回收（reclaimed）
+    的租约不会再命中，因此**重复调用、与确认接口并发都幂等，同一配额绝不释放
+    两次**。无到期预留时返回 reclaimed_count=0。
+    """
+    return QuotaReclaimOut(**database.reclaim_expired_leases())
+
+
+@app.post("/api/tasks/{task_id}/quota/confirm", response_model=QuotaConfirmOut)
+def confirm_task_quota(task_id: int, payload: QuotaConfirmIn) -> QuotaConfirmOut:
+    """任务完成后凭 reservation_token 在租约到期前主动确认预留。
+
+    - 任务不存在或无租约返回 404（非租约任务无预留可确认）；
+    - 令牌错误返回 403；
+    - 预留尚未生效（任务未结算）返回 422（code=awaiting）；任务未产生预留
+      （无解/失败/配额不足，租约作废）返回 422（code=void）；
+    - 租约已过期或已被回收返回 422（code=expired）——**过期后确认绝不释放或
+      重新扣减配额**，过期预留只能由回收接口返还；
+    - 到期前确认成功返回 code=confirmed；**重复确认幂等**，返回
+      code=already_confirmed 与当前租约状态。
+    """
+    if database.get_task(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    code, lease = database.confirm_quota_reservation(
+        task_id, payload.reservation_token
+    )
+    if code == "no_lease":
+        raise HTTPException(status_code=404, detail="该任务没有可确认的配额预留租约")
+    if code == "bad_token":
+        raise HTTPException(status_code=403, detail="reservation_token 无效")
+    if code in ("awaiting", "void", "expired"):
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "预留当前不可确认", "code": code, "lease": lease},
+        )
+    return QuotaConfirmOut(task_id=task_id, code=code, lease=QuotaLeaseOut(**lease))
+
+
+@app.post(
+    "/api/tasks",
+    response_model=TaskCreated,
+    status_code=201,
+    response_model_exclude_none=True,
+)
 def create_task(payload: ExamTaskIn) -> TaskCreated:
     """提交组卷任务：题库快照 + 总分/题型/知识点/难度/互斥题组约束。"""
     req = payload.model_dump()
-    task_id = database.create_task(
+    task_id, reservation_token = database.create_task(
         payload.name,
         json.dumps(req, ensure_ascii=False),
         payload.seed,
+        lease_seconds=payload.lease_seconds,
     )
     submit(task_id)
-    return TaskCreated(task_id=task_id, status="pending")
+    return TaskCreated(
+        task_id=task_id,
+        status="pending",
+        lease_seconds=payload.lease_seconds,
+        reservation_token=reservation_token,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +218,7 @@ def _validation_detail(exc: ValidationError) -> List[Dict[str, Any]]:
     "/api/templates/{template_id}/tasks",
     response_model=TemplateTaskCreated,
     status_code=201,
+    response_model_exclude_none=True,
 )
 def create_task_from_template(
     template_id: int, payload: TemplateTaskIn
@@ -190,6 +253,7 @@ def create_task_from_template(
             questions=payload.questions,
             seed=payload.seed,
             use_quota=payload.use_quota,
+            lease_seconds=payload.lease_seconds,
             **merged,
         )
     except ValidationError as exc:
@@ -203,10 +267,11 @@ def create_task_from_template(
     frozen["kind"] = "template"
     frozen["template_id"] = row["id"]
     frozen["template_version"] = row["version"]
-    task_id = database.create_task(
+    task_id, reservation_token = database.create_task(
         name,
         json.dumps(frozen, ensure_ascii=False),
         payload.seed,
+        lease_seconds=payload.lease_seconds,
     )
     submit(task_id)
     return TemplateTaskCreated(
@@ -214,6 +279,8 @@ def create_task_from_template(
         status="pending",
         template_id=row["id"],
         template_version=row["version"],
+        lease_seconds=payload.lease_seconds,
+        reservation_token=reservation_token,
     )
 
 
@@ -392,6 +459,12 @@ def get_task(task_id: int) -> TaskStatus:
                 quota_status = "exceeded"
             elif result.status == "feasible":
                 quota_status = "reserved"
+        lease_info: Optional[QuotaLeaseOut] = None
+        if req.get("lease_seconds") is not None:
+            lease_row = database.get_quota_lease(task_id)
+            # 正常必有租约行；即便行被离线删除也只表现为无 lease 块，不影响任务查询
+            if lease_row is not None:
+                lease_info = QuotaLeaseOut(**database.lease_out(lease_row))
         quota_info = TaskQuotaOut(
             status=quota_status,
             reservations=[
@@ -402,6 +475,7 @@ def get_task(task_id: int) -> TaskStatus:
                 )
                 for r in database.get_quota_reservations(task_id)
             ],
+            lease=lease_info,
         )
 
     return TaskStatus(

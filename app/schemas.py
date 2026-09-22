@@ -90,6 +90,18 @@ class ExamTaskIn(BaseModel):
             "不扣减，任务结果返回 quota_exceeded 及缺额明细"
         ),
     )
+    lease_seconds: Optional[int] = Field(
+        None,
+        ge=1,
+        description=(
+            "配额预留租约有效期（正整数秒）：仅可在 use_quota=true 时设置。"
+            "配额扣减即生成预留租约并返回 reservation_token；任务完成后需在"
+            " expires_at 之前调用 POST /api/tasks/{id}/quota/confirm 主动确认，"
+            "逾期未确认的预留由 POST /api/quotas/reclaim-expired 在 SQLite 事务中"
+            "原子释放（配额按题返还）并标记 expired；缺省（null）表示旧式直接扣减、"
+            "无租约"
+        ),
+    )
     seed: int = Field(42, description="随机种子，保证同请求结果可复现")
 
     @field_validator("total_score")
@@ -101,6 +113,9 @@ class ExamTaskIn(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "ExamTaskIn":
+        # 租约只对启用配额的任务有意义
+        if self.lease_seconds is not None and not self.use_quota:
+            raise ValueError("lease_seconds 仅可在 use_quota=true 时设置")
         # 难度区间合法性
         lo, hi = self.difficulty_range
         if not (0.0 <= lo <= hi <= 1.0):
@@ -312,6 +327,14 @@ class TemplateTaskIn(BaseModel):
             "也不可经 overrides 覆盖）；语义与 /api/tasks 的 use_quota 一致"
         ),
     )
+    lease_seconds: Optional[int] = Field(
+        None,
+        ge=1,
+        description=(
+            "配额预留租约有效期（正整数秒，实例化请求的独立字段、不属于模板配置，"
+            "也不可经 overrides 覆盖）；语义与 /api/tasks 的 lease_seconds 一致"
+        ),
+    )
     overrides: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -328,6 +351,14 @@ class TemplateTaskCreated(BaseModel):
     status: str
     template_id: int
     template_version: int
+    lease_seconds: Optional[int] = Field(
+        None,
+        description="配额预留租约有效期（秒）：仅创建带租约的配额任务时回显",
+    )
+    reservation_token: Optional[str] = Field(
+        None,
+        description="预留确认令牌：仅创建带租约的配额任务时返回，仅此一次",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -381,6 +412,31 @@ class QuotaReservationOut(BaseModel):
     remaining: int = Field(..., description="本次扣减后的剩余次数快照")
 
 
+class QuotaLeaseOut(BaseModel):
+    """预留租约状态（查询任务、主动确认、回收接口共用）。"""
+
+    status: str = Field(
+        ...,
+        description=(
+            "awaiting（任务尚未结算，租约未生效）/ reserved（未确认且未过期）/ "
+            "confirmed（已主动确认，配额永久扣减）/ expired（已过有效期，等待或已由"
+            "回收接口释放）/ reclaimed（过期预留已被回收，配额已返还）/ "
+            "void（任务最终未产生预留：无解、失败或配额不足，租约作废）"
+        ),
+    )
+    lease_seconds: int = Field(..., description="租约有效期（创建时冻结的秒数）")
+    expires_at: Optional[str] = Field(
+        None,
+        description="到期时间（UTC ISO 8601，Z 结尾）：配额扣减生效时确定；awaiting/void 状态为 null",
+    )
+    confirmed_at: Optional[str] = Field(
+        None, description="主动确认时间（UTC ISO 8601，Z 结尾）；未确认时为 null"
+    )
+    released_at: Optional[str] = Field(
+        None, description="过期预留被回收释放的时间（UTC ISO 8601，Z 结尾）；未回收时为 null"
+    )
+
+
 class TaskQuotaOut(BaseModel):
     """任务查询返回的配额信息（仅创建时声明 use_quota 的任务返回）。"""
 
@@ -390,6 +446,56 @@ class TaskQuotaOut(BaseModel):
     )
     reservations: List[QuotaReservationOut] = Field(
         default_factory=list, description="本次预留明细：题号、扣减次数与扣后剩余快照"
+    )
+    lease: Optional[QuotaLeaseOut] = Field(
+        None,
+        description=(
+            "预留租约状态（仅创建时设置了 lease_seconds 的任务返回）；"
+            "未设置 lease_seconds 的旧式直接扣减任务不返回该字段"
+        ),
+    )
+
+
+class QuotaConfirmIn(BaseModel):
+    """预留主动确认请求：提交创建任务时下发的 reservation_token。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_token: str = Field(..., min_length=1, description="创建带租约任务时返回的预留确认令牌")
+
+
+class QuotaConfirmOut(BaseModel):
+    """预留主动确认结果（重复确认幂等，返回当前租约状态）。"""
+
+    task_id: int
+    code: str = Field(
+        ...,
+        description=(
+            "confirmed（本次确认成功）/ already_confirmed（此前已确认，幂等）/ "
+            "expired（已过期或已被回收，确认不生效）/ awaiting（预留尚未生效）/ "
+            "void（任务未产生预留，租约作废）"
+        ),
+    )
+    lease: QuotaLeaseOut
+
+
+class QuotaReclaimedItem(BaseModel):
+    """单次过期回收中某任务按题返还的明细项。"""
+
+    task_id: int
+    question_id: QuestionId
+    returned: int = Field(..., description="该题本次返还（恢复可用）的次数")
+
+
+class QuotaReclaimOut(BaseModel):
+    """过期预留回收结果：重复/并发调用幂等（无到期预留时 reclaimed_count=0）。"""
+
+    reclaimed_count: int = Field(
+        ..., description="本次实际回收的过期预留（任务）数；已被回收或确认的不会重复计入"
+    )
+    returned_total: int = Field(..., description="本次按题返还配额的次数合计")
+    reclaimed: List[QuotaReclaimedItem] = Field(
+        default_factory=list, description="本次回收的逐任务逐题返还明细"
     )
 
 
@@ -515,6 +621,20 @@ class TaskResult(BaseModel):
 class TaskCreated(BaseModel):
     task_id: int
     status: str
+    lease_seconds: Optional[int] = Field(
+        None,
+        description=(
+            "配额预留租约有效期（秒）：仅创建带租约的配额任务时回显；"
+            "租约在配额扣减（任务可行结算）时生效，到期时间查询任务详情获取"
+        ),
+    )
+    reservation_token: Optional[str] = Field(
+        None,
+        description=(
+            "预留确认令牌：仅创建带租约（use_quota=true 且 lease_seconds>=1）的任务时"
+            "返回，仅此一次；任务结算出预留后凭它在到期前调用确认接口主动确认"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #

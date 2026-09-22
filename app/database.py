@@ -6,11 +6,19 @@
 组卷模板（templates 表）：创建后不可变——只提供插入与查询，没有任何更新
 接口；修改约束配置只能通过创建新版本（同一 root_id 谱系下 version 递增）。
 
-题目曝光配额（quotas / quota_reservations 表）：按题号维护可用次数；
-启用配额的任务在可行组卷完成时，于**单个 SQLite 事务**（BEGIN IMMEDIATE）
+题目曝光配额（quotas / quota_reservations / quota_leases 表）：按题号维护
+可用次数；启用配额的任务在可行组卷完成时，于**单个 SQLite 事务**（BEGIN IMMEDIATE）
 中串行化校验并原子扣减——任一题余额不足则整组不扣减，任务结果改写为
 quota_exceeded 并附缺额明细；扣减成功时逐题写入预留记录（含扣后剩余快照），
 供任务查询接口回显“本次预留及剩余次数”。
+
+预留租约（quota_leases 表）：带 lease_seconds 创建的配额任务在创建时即落一条
+awaiting 租约并下发一次性 reservation_token；配额成功扣减的同一事务把租约激活为
+reserved 并冻结 expires_at（结算时刻 + lease_seconds）。持 token 在到期前可调用
+确认接口把租约原子置为 confirmed（配额永久扣减，重复确认幂等）；过期未确认的预留
+由回收接口在**单个 SQLite 事务**中按条件更新抢占式回收（reserved -> reclaimed）
+并逐题返还配额，条件 UPDATE 保证确认与回收、回收与回收并发互斥，同一配额绝不会
+释放两次。任务最终未产生预留（无解/失败/配额不足）时租约在同事务置为 void。
 
 防篡改审计链（task_audit_events 表）：任务创建（created）、开始（started）、
 完成或失败（finished）及配额结算（quota_settled）均在**同一任务状态写入所在
@@ -26,9 +34,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 DB_PATH = os.environ.get("EXAM_DB_PATH", "/data/exam.db")
@@ -97,6 +106,27 @@ def init_db() -> None:
             )
             """
         )
+        # 可过期的预留租约：每个设置了 lease_seconds 的配额任务一行。
+        # status 状态机：awaiting（已建约、任务未结算，expires_at 为空）
+        #   -> reserved（配额已扣减、租约生效，冻结 expires_at）
+        #   -> confirmed（到期前持 token 主动确认，配额永久扣减）
+        #   -> reclaimed（过期后被回收接口原子释放，配额已逐题返还）；
+        # 任务未产生预留（无解/失败/配额不足）则 awaiting -> void。
+        # 状态流转一律走带状态/到期条件的 UPDATE 抢占，杜绝同一配额释放两次。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quota_leases (
+                task_id          INTEGER PRIMARY KEY,
+                reservation_token TEXT NOT NULL UNIQUE,
+                lease_seconds    INTEGER NOT NULL CHECK (lease_seconds > 0),
+                status           TEXT NOT NULL DEFAULT 'awaiting',
+                expires_at       TEXT,
+                confirmed_at     TEXT,
+                released_at      TEXT,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
         # 防篡改审计链：同一任务 seq 从 1 连续递增、唯一；prev_hash 链向前一
         # 事件哈希（首事件为 64 个 0）；hash 为事件内容（规范化 JSON）的 SHA-256。
         # payload 为规范化 JSON 文本（最小业务载荷），事件只追加、永不更新/删除。
@@ -117,14 +147,34 @@ def init_db() -> None:
         )
 
 
-def create_task(name: Optional[str], request_json: str, seed: int) -> int:
+def create_task(
+    name: Optional[str],
+    request_json: str,
+    seed: int,
+    lease_seconds: Optional[int] = None,
+) -> Tuple[int, Optional[str]]:
+    """创建任务，返回 (task_id, reservation_token)。
+
+    lease_seconds 为正整数时在**同一事务**内预建 awaiting 租约并生成一次性
+    reservation_token；租约此时尚未生效（expires_at 为空），要等任务可行结算
+    扣减配额时才激活。未设置租约时 token 返回 None。
+    """
     with _lock, get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO tasks (name, status, request, seed) VALUES (?, 'pending', ?, ?)",
             (name, request_json, seed),
         )
         task_id = int(cur.lastrowid)
-        # created 事件与任务行在同一事务原子提交；载荷内冻结请求摘要，
+        reservation_token: Optional[str] = None
+        if lease_seconds is not None:
+            reservation_token = _new_reservation_token()
+            conn.execute(
+                "INSERT INTO quota_leases"
+                " (task_id, reservation_token, lease_seconds, status)"
+                " VALUES (?, ?, ?, 'awaiting')",
+                (task_id, reservation_token, int(lease_seconds)),
+            )
+        # created 事件与任务行（及租约行）在同一事务原子提交；载荷内冻结请求摘要，
         # 事后任何对 tasks.request 的篡改都会在交叉校验中暴露
         append_audit_event(
             conn,
@@ -136,7 +186,12 @@ def create_task(name: Optional[str], request_json: str, seed: int) -> int:
                 "request_sha256": _sha256_text(request_json),
             },
         )
-        return task_id
+        return task_id, reservation_token
+
+
+def _new_reservation_token() -> str:
+    """生成不可猜测的一次性预留确认令牌（URL 安全随机串）。"""
+    return secrets.token_urlsafe(32)
 
 
 def update_status(task_id: int, status: str) -> None:
@@ -146,12 +201,24 @@ def update_status(task_id: int, status: str) -> None:
         append_audit_event(conn, task_id, "started", {"status": status})
 
 
-def finish_task(task_id: int, result_json: str) -> None:
+def finish_task(
+    task_id: int,
+    result_json: str,
+    void_lease: bool = False,
+) -> None:
     with _lock, get_conn() as conn:
         conn.execute(
             "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
             (result_json, task_id),
         )
+        # 带租约的配额任务最终未走扣减结算（无解/失败）：租约在同事务作废，
+        # 任何持 token 的确认请求都不可能再得到配额
+        if void_lease:
+            conn.execute(
+                "UPDATE quota_leases SET status = 'void' WHERE task_id = ?"
+                " AND status = 'awaiting'",
+                (task_id,),
+            )
         # feasible / infeasible / error 统一记为 finished，成败以 payload.status 区分；
         # 事件与任务结果落库原子提交，载荷冻结结果摘要
         append_audit_event(
@@ -769,6 +836,30 @@ def finish_task_with_quota(
             "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
             (final_json, task_id),
         )
+        # 预留租约与扣减结果在同一事务流转，杜绝“已扣减但租约未生效”的中间态：
+        # 成功扣减则激活租约（reserved，expires_at = 当前 UTC + lease_seconds），
+        # 配额不足则租约作废（void）；未声明租约的任务无此行，语句不命中任何行
+        lease_row = conn.execute(
+            "SELECT lease_seconds FROM quota_leases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if lease_row is not None:
+            if shortages:
+                conn.execute(
+                    "UPDATE quota_leases SET status = 'void' WHERE task_id = ?"
+                    " AND status = 'awaiting'",
+                    (task_id,),
+                )
+            else:
+                expires_at = (
+                    datetime.now(timezone.utc).replace(microsecond=0)
+                    + timedelta(seconds=int(lease_row["lease_seconds"]))
+                ).isoformat().replace("+00:00", "Z")
+                conn.execute(
+                    "UPDATE quota_leases SET status = 'reserved', expires_at = ?"
+                    " WHERE task_id = ? AND status = 'awaiting'",
+                    (expires_at, task_id),
+                )
         # finished：冻结任务最终结果摘要（含 quota_exceeded）
         append_audit_event(
             conn,
@@ -795,3 +886,174 @@ def finish_task_with_quota(
                 {"outcome": "reserved", "items": settled_items},
             )
     return final
+
+
+# --------------------------------------------------------------------------- #
+# 预留租约：查询、到期前主动确认、过期回收（全部在单事务中按条件更新，幂等）
+# --------------------------------------------------------------------------- #
+def lease_out(row: sqlite3.Row) -> Dict[str, Any]:
+    """把 quota_leases 行转换为接口输出字典（status 为含到期判断的有效状态）。"""
+    status = row["status"]
+    expires_at = row["expires_at"]
+    # 逻辑到期：DB 内仍是 reserved 但已过 expires_at——回收接口未必刚跑过；
+    # 查询侧据此报告 expired，实际配额释放仍只由回收接口完成（避免双重释放）
+    if (
+        status == "reserved"
+        and expires_at is not None
+        and expires_at <= _now_iso()
+    ):
+        status = "expired"
+    return {
+        "status": status,
+        "lease_seconds": int(row["lease_seconds"]),
+        "expires_at": expires_at,
+        "confirmed_at": row["confirmed_at"],
+        "released_at": row["released_at"],
+    }
+
+
+def get_quota_lease(task_id: int) -> Optional[sqlite3.Row]:
+    """读取某任务的租约原始行（无租约返回 None）。"""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT task_id, reservation_token, lease_seconds, status,"
+            " expires_at, confirmed_at, released_at, created_at"
+            " FROM quota_leases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+
+def confirm_quota_reservation(
+    task_id: int, token: str
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """持 reservation_token 在到期前主动确认预留。
+
+    返回 (结果码, 租约输出或 None)，结果码：
+    - ``no_lease``   ：任务没有租约（非租约任务或不存在配额设置）；
+    - ``bad_token``  ：令牌不匹配（不泄露租约当前状态）；
+    - ``confirmed``  ：本次确认成功（reserved -> confirmed）；
+    - ``already_confirmed``：此前已确认（幂等，配额只扣一次）；
+    - ``expired``    ：租约已过期（DB 状态 expired/reclaimed，或 reserved 但
+      expires_at 已过）；过期确认绝不释放配额，只由回收接口释放；
+    - ``awaiting``   ：任务尚未结算、预留尚未生效；
+    - ``void``       ：任务未产生预留（无解/失败/配额不足），租约已作废。
+
+    确认走**带状态与到期条件的单条 UPDATE**（进程内互斥锁 + BEGIN IMMEDIATE）：
+    与回收接口并发时只有一方的条件更新能命中行，确认与返还严格互斥。
+    """
+    now = _now_iso()
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT reservation_token, lease_seconds, status, expires_at,"
+            " confirmed_at, released_at FROM quota_leases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return "no_lease", None
+        if not secrets.compare_digest(row["reservation_token"], token):
+            conn.commit()
+            return "bad_token", None
+
+        status = row["status"]
+        if status == "reserved" and row["expires_at"] is not None and row["expires_at"] <= now:
+            # 到期时刻只用于拒绝确认；不在确认路径释放配额（释放只能经回收接口）
+            code = "expired"
+        elif status == "reserved":
+            cur = conn.execute(
+                "UPDATE quota_leases SET status = 'confirmed', confirmed_at = ?"
+                " WHERE task_id = ? AND status = 'reserved' AND (expires_at IS NULL"
+                " OR expires_at > ?)",
+                (now, task_id, now),
+            )
+            # 行计数是与回收/并发确认互斥的唯一裁决：命中 1 行才算本次确认
+            code = "confirmed" if cur.rowcount == 1 else "expired"
+        elif status == "confirmed":
+            code = "already_confirmed"
+        elif status in ("expired", "reclaimed"):
+            code = "expired"
+        elif status == "void":
+            code = "void"
+        else:  # awaiting
+            code = "awaiting"
+
+        final_row = conn.execute(
+            "SELECT lease_seconds, status, expires_at, confirmed_at, released_at"
+            " FROM quota_leases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        conn.commit()
+        return code, lease_out(final_row)
+
+
+def reclaim_expired_leases() -> Dict[str, Any]:
+    """回收所有已过期且未确认的预留：在**单个 SQLite 事务**中原子释放并标记。
+
+    流程（全程持进程内互斥锁 + BEGIN IMMEDIATE，与确认接口/其它扣减串行）：
+    1. 选出 status='reserved' 且 expires_at <= 当前 UTC 的租约（到期判定只认
+       expires_at，不读可能被改写的时钟之外的状态）；
+    2. 对每个任务先按条件抢占式 ``UPDATE ... WHERE status='reserved' AND
+       expires_at <= now``——只有行计数为 1（本事务赢得竞争）才返还配额；
+    3. 返还：按 quota_reservations 的逐题预留把 reserved 次数加回 quotas
+       （配额行在此期间被删除/覆盖时重建为返还值），随后才把租约置为
+       reclaimed 并记录 released_at；返还、状态更新、其它任务的回收全部在
+       同一事务提交——要么整体生效，要么整体回滚。
+
+    重复调用、确认与回收并发均幂等：已 reclaimed/confirmed 的行永远不再命中
+    条件更新，因此同一预留的配额不可能被释放两次。
+    返回 {"reclaimed_count", "returned_total", "reclaimed": [...]}。
+    """
+    now = _now_iso()
+    reclaimed_items: List[Dict[str, Any]] = []
+    returned_total = 0
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT task_id FROM quota_leases"
+            " WHERE status = 'reserved' AND expires_at IS NOT NULL"
+            " AND expires_at <= ? ORDER BY task_id",
+            (now,),
+        ).fetchall()
+        for r in rows:
+            task_id = int(r["task_id"])
+            # 抢占：状态 + 到期双条件。并发回收/确认只有一方能把 rowcount 置 1
+            cur = conn.execute(
+                "UPDATE quota_leases SET status = 'reclaimed', released_at = ?"
+                " WHERE task_id = ? AND status = 'reserved' AND expires_at <= ?",
+                (now, task_id, now),
+            )
+            if cur.rowcount != 1:
+                continue
+            items = conn.execute(
+                "SELECT question_id, reserved FROM quota_reservations"
+                " WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+            for it in items:
+                need = int(it["reserved"])
+                bal = conn.execute(
+                    "SELECT quota FROM quotas WHERE question_id = ?",
+                    (it["question_id"],),
+                ).fetchone()
+                restored = (int(bal["quota"]) if bal is not None else 0) + need
+                conn.execute(
+                    "INSERT INTO quotas (question_id, quota, updated_at)"
+                    " VALUES (?, ?, datetime('now'))"
+                    " ON CONFLICT(question_id) DO UPDATE SET"
+                    "   quota = excluded.quota, updated_at = excluded.updated_at",
+                    (it["question_id"], restored),
+                )
+                reclaimed_items.append(
+                    {
+                        "task_id": task_id,
+                        "question_id": json.loads(it["question_id"]),
+                        "returned": need,
+                    }
+                )
+                returned_total += need
+    return {
+        "reclaimed_count": len({i["task_id"] for i in reclaimed_items}),
+        "returned_total": returned_total,
+        "reclaimed": reclaimed_items,
+    }
