@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 QuestionId = Union[int, str]
 
+#: 启用配额任务的预留租约默认有效期（秒）：未显式给 lease_seconds 时采用。
+DEFAULT_LEASE_SECONDS = 300
+
 
 class QuestionIn(BaseModel):
     """题库快照中的一道题。"""
@@ -87,10 +90,38 @@ class ExamTaskIn(BaseModel):
         description=(
             "是否启用题目曝光配额：启用后任务完成可行组卷时，按排名第 1 候选各卷"
             "选中题号的出现次数在 SQLite 事务中原子扣减配额；任一题余额不足则整组"
-            "不扣减，任务结果返回 quota_exceeded 及缺额明细"
+            "不扣减，任务结果返回 quota_exceeded 及缺额明细。扣减以**可过期预留租约**"
+            "形式持有：lease_seconds 给出有效期，reservation_token 用于任务完成后主动确认"
+        ),
+    )
+    lease_seconds: Optional[int] = Field(
+        None,
+        ge=1,
+        le=31_536_000,
+        description=(
+            "配额预留租约有效期（秒，正整数，最长 1 年）：配额扣减成功后"
+            "（status=active 起）超过该时长仍未用 reservation_token 确认的预留，"
+            "可由回收接口原子释放；仅 use_quota=true 时可设置，缺省 300 秒"
+        ),
+    )
+    reservation_token: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "预留租约确认令牌（非空字符串，最长 200 字符）：任务完成可行组卷并"
+            "成功扣减配额后，用该令牌主动确认预留；缺省时服务端随机生成并随"
+            "创建响应返回。仅 use_quota=true 时可设置"
         ),
     )
     seed: int = Field(42, description="随机种子，保证同请求结果可复现")
+
+    @field_validator("reservation_token")
+    @classmethod
+    def _token_stripped(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("reservation_token 不能为空白字符串")
+        return v.strip() if v is not None else None
 
     @field_validator("total_score")
     @classmethod
@@ -139,6 +170,15 @@ class ExamTaskIn(BaseModel):
         # 多候选时 min_question_changes 缺省 1；单候选下该参数不参与求解
         if self.alternative_count >= 2 and self.min_question_changes is None:
             self.min_question_changes = 1
+
+        # 租约参数仅在启用配额时有意义；启用后 lease_seconds 落定缺省值
+        if not self.use_quota:
+            if self.lease_seconds is not None:
+                raise ValueError("lease_seconds 仅在 use_quota=true 时可设置")
+            if self.reservation_token is not None:
+                raise ValueError("reservation_token 仅在 use_quota=true 时可设置")
+        elif self.lease_seconds is None:
+            self.lease_seconds = DEFAULT_LEASE_SECONDS
         return self
 
 
@@ -312,6 +352,18 @@ class TemplateTaskIn(BaseModel):
             "也不可经 overrides 覆盖）；语义与 /api/tasks 的 use_quota 一致"
         ),
     )
+    lease_seconds: Optional[int] = Field(
+        None,
+        ge=1,
+        le=31_536_000,
+        description="配额预留租约有效期（秒），语义同 /api/tasks；仅 use_quota=true 时可设置",
+    )
+    reservation_token: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description="预留租约确认令牌，语义同 /api/tasks；缺省由服务端生成",
+    )
     overrides: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -328,6 +380,19 @@ class TemplateTaskCreated(BaseModel):
     status: str
     template_id: int
     template_version: int
+    lease_seconds: Optional[int] = Field(
+        None, description="配额预留租约有效期（秒，仅 use_quota=true 时返回）"
+    )
+    reservation_token: Optional[str] = Field(
+        None, description="预留租约确认令牌（客户端提供或服务端生成；仅 use_quota=true 时返回）"
+    )
+    expires_at: Optional[str] = Field(
+        None,
+        description=(
+            "租约到期时间（UTC ISO 8601，微秒级，Z 结尾）：当前为任务创建时的预估时间，"
+            "配额扣减成功后以 GET 任务返回的 lease.expires_at 为准；仅 use_quota=true 时返回"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -381,6 +446,33 @@ class QuotaReservationOut(BaseModel):
     remaining: int = Field(..., description="本次扣减后的剩余次数快照")
 
 
+class QuotaLeaseOut(BaseModel):
+    """配额预留租约状态（随任务查询返回；仅成功扣减过配额的任务存在）。"""
+
+    status: str = Field(
+        ...,
+        description=(
+            "租约状态：active（已扣减、等待确认，且未到 expires_at）/ "
+            "confirmed（已用 token 确认，配额永久消耗）/ expired（已过期并由回收接口释放）。"
+            "已过 expires_at 但尚未回收的活动租约在查询时按 expired 报告（配额实际释放以回收接口为准）"
+        ),
+    )
+    lease_seconds: int = Field(..., description="租约有效期（秒，创建时冻结）")
+    reservation_token: Optional[str] = Field(
+        None,
+        description="确认令牌明文（创建时由客户端提供或服务端生成；仅返回一次语义上的持有凭据，便于调用确认接口）",
+    )
+    expires_at: Optional[str] = Field(
+        None, description="租约到期时间（UTC ISO 8601，微秒级，Z 结尾）；pending 状态任务为 null"
+    )
+    confirmed_at: Optional[str] = Field(
+        None, description="确认时间（UTC ISO 8601，微秒级，Z 结尾；仅 confirmed 返回）"
+    )
+    expired_at: Optional[str] = Field(
+        None, description="回收释放时间（UTC ISO 8601，微秒级，Z 结尾；仅 expired 返回）"
+    )
+
+
 class TaskQuotaOut(BaseModel):
     """任务查询返回的配额信息（仅创建时声明 use_quota 的任务返回）。"""
 
@@ -388,8 +480,81 @@ class TaskQuotaOut(BaseModel):
         None,
         description="reserved（已扣减）/ exceeded（余额不足未扣减）；任务未完成时不返回该字段",
     )
+    lease_seconds: Optional[int] = Field(
+        None, description="创建时冻结的租约有效期（秒）；仅 use_quota 任务返回"
+    )
+    reservation_token: Optional[str] = Field(
+        None, description="预留确认令牌；仅 use_quota 任务返回（exceeded 后不再有效）"
+    )
+    lease: Optional[QuotaLeaseOut] = Field(
+        None,
+        description=(
+            "租约状态与到期时间：任务完成成功扣减后返回（pending/running 为 pending，"
+            "扣减成功后 active → confirmed/expired）；quota_exceeded 时为 null"
+        ),
+    )
     reservations: List[QuotaReservationOut] = Field(
-        default_factory=list, description="本次预留明细：题号、扣减次数与扣后剩余快照"
+        default_factory=list, description="本次预留明细：题号、扣减次数与扣后剩余快照（租约释放后记录仍保留作审计快照）"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 预留租约：令牌确认与过期回收
+# --------------------------------------------------------------------------- #
+class QuotaConfirmIn(BaseModel):
+    """预留租约确认请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_token: str = Field(
+        ..., min_length=1, max_length=200, description="任务创建时获得的预留确认令牌"
+    )
+
+    @field_validator("reservation_token")
+    @classmethod
+    def _token_stripped(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reservation_token 不能为空白字符串")
+        return v.strip()
+
+
+class QuotaConfirmOut(BaseModel):
+    """预留租约确认结果（重复确认 / 过期后确认均幂等返回）。"""
+
+    task_id: int
+    status: str = Field(
+        ...,
+        description=(
+            "confirmed（本次确认成功或此前已确认）/ expired（租约已过期，"
+            "可能已被回收释放，本次不消耗也不释放配额）"
+        ),
+    )
+    already: bool = Field(
+        ..., description="是否为重复确认（此前已处于同一终态）；首次成功确认 / 首次发现过期为 false"
+    )
+    released: bool = Field(..., description="配额是否已通过回收接口释放（status=expired 时可能为 true/false）")
+    expires_at: Optional[str] = Field(None, description="租约到期时间（UTC ISO 8601，Z 结尾）")
+    confirmed_at: Optional[str] = Field(None, description="确认时间（UTC ISO 8601，Z 结尾）")
+    expired_at: Optional[str] = Field(None, description="回收释放时间（UTC ISO 8601，Z 结尾）")
+
+
+class ReclaimedItemOut(BaseModel):
+    """单次回收中某题号被释放的汇总明细。"""
+
+    question_id: QuestionId
+    released: int = Field(..., description="本次回收为该题累计释放（归还）的次数")
+    quota_after: int = Field(..., description="该题释放并合并后的当前可用次数")
+
+
+class QuotaReclaimOut(BaseModel):
+    """过期预留回收结果：已回收租约数、释放次数与逐题汇总；重复 / 并发调用幂等。"""
+
+    reclaimed_count: int = Field(
+        ..., description="本次调用实际由 active→expired 的租约数（并发回收只有一方计 1）"
+    )
+    released_total: int = Field(..., description="本次调用累计归还到配额余额的总次数")
+    items: List[ReclaimedItemOut] = Field(
+        default_factory=list, description="逐题释放汇总（按题号规范排序）"
     )
 
 
@@ -515,6 +680,20 @@ class TaskResult(BaseModel):
 class TaskCreated(BaseModel):
     task_id: int
     status: str
+    lease_seconds: Optional[int] = Field(
+        None, description="配额预留租约有效期（秒，仅 use_quota=true 时返回）"
+    )
+    reservation_token: Optional[str] = Field(
+        None, description="预留租约确认令牌（客户端提供或服务端生成；仅 use_quota=true 时返回）"
+    )
+    expires_at: Optional[str] = Field(
+        None,
+        description=(
+            "预估的租约到期时间（UTC ISO 8601，微秒级，Z 结尾；以任务创建时刻 + "
+            "lease_seconds 计，扣减成功后以 GET 任务的 lease.expires_at 为准）；"
+            "仅 use_quota=true 时返回"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -525,7 +704,11 @@ class AuditEventOut(BaseModel):
 
     seq: int = Field(..., description="同任务内从 1 起连续递增的事件序号")
     type: str = Field(
-        ..., description="事件类型：created / started / finished / quota_settled"
+        ...,
+        description=(
+            "事件类型：created / started / finished / quota_settled / "
+            "quota_confirmed（租约确认）/ quota_expired（租约过期回收）"
+        ),
     )
     created_at: str = Field(..., description="事件时间（UTC ISO 8601，秒级，Z 结尾）")
     payload: Dict[str, Any] = Field(

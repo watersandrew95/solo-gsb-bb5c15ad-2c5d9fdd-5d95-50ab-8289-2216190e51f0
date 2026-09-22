@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import asynccontextmanager
@@ -13,12 +13,18 @@ from pydantic import ValidationError
 from . import database
 from .review import solve_review_plan
 from .schemas import (
+    DEFAULT_LEASE_SECONDS,
     OVERRIDABLE_FIELDS,
     AuditEventOut,
     ExamTaskIn,
+    QuotaConfirmIn,
+    QuotaConfirmOut,
+    QuotaLeaseOut,
     QuotaOut,
+    QuotaReclaimOut,
     QuotaReservationOut,
     QuotaSetIn,
+    ReclaimedItemOut,
     ReviewPlanIn,
     ReviewPlanOut,
     ReviseTaskIn,
@@ -51,9 +57,37 @@ app = FastAPI(
         "按题号扣减的题目曝光配额，"
         "以及面向已完成且可行任务的盲审分配"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
+
+
+def _lease_from_request(
+    use_quota: bool,
+    lease_seconds: Optional[int],
+    reservation_token: Optional[str],
+) -> Tuple[Optional[int], str]:
+    """生成/落定租约参数：返回 (lease_seconds, reservation_token)。
+
+    仅对 use_quota 任务调用：lease_seconds 缺省取 DEFAULT_LEASE_SECONDS，
+    令牌缺省由服务端随机生成（secrets.token_urlsafe）。
+    """
+    if not use_quota:
+        return None, reservation_token or ""
+    seconds = lease_seconds if lease_seconds is not None else DEFAULT_LEASE_SECONDS
+    token = reservation_token or database.generate_reservation_token()
+    return seconds, token
+
+
+def _estimated_expires_at(lease_seconds: int) -> str:
+    """创建响应中的预估到期时间（任务创建时刻 + lease_seconds，微秒级 UTC）。
+
+    仅作创建时的预告；配额实际扣减后的权威到期时间以 GET 任务的
+    quota.lease.expires_at 为准（扣减时刻 + lease_seconds）。
+    """
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=int(lease_seconds))
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 @app.get("/health")
@@ -90,16 +124,111 @@ def list_quotas() -> List[QuotaOut]:
     return [_quota_out(r) for r in database.list_quotas()]
 
 
+@app.post("/api/quotas/reclaim-expired", response_model=QuotaReclaimOut)
+def reclaim_expired_quotas() -> QuotaReclaimOut:
+    """回收全部已过期但未确认的预留租约（幂等，可安全并发/重复调用）。
+
+    在**单个 SQLite 事务**（进程锁 + BEGIN IMMEDIATE）中扫描所有
+    ``active`` 且 ``expires_at <= now`` 的租约，逐条做仅当仍满足条件的
+    状态翻转并把逐题预留次数归还配额余额；翻转与 ``quota_expired`` 审计
+    事件同事务原子提交。条件 UPDATE 保证并发回收只有一方生效，**同一配额
+    绝不会被释放两次**；没有过期租约时返回全 0。
+    """
+    summary = database.reclaim_expired_leases()
+    return QuotaReclaimOut(
+        reclaimed_count=summary["reclaimed_count"],
+        released_total=summary["released_total"],
+        items=[ReclaimedItemOut(**it) for it in summary["items"]],
+    )
+
+
+@app.post("/api/tasks/{task_id}/quota/confirm", response_model=QuotaConfirmOut)
+def confirm_quota(task_id: int, payload: QuotaConfirmIn) -> QuotaConfirmOut:
+    """用 reservation_token 主动确认预留租约（幂等）。
+
+    - 令牌正确且租约未到期：active → confirmed，配额永久消耗（200）；
+    - 重复确认：幂等返回 ``confirmed``（``already=true``），不二次处理配额；
+    - 已过到期时间（含已被/未被回收）：返回 ``expired``；过期确认不确认、
+      不释放——释放只可能由 ``POST /api/quotas/reclaim-expired`` 完成，
+      因此确认与回收的任意并发/重复组合都不会把同一配额释放两次；
+    - 任务不存在或无预留（含 quota_exceeded）：404；令牌错误：403；
+      任务尚未结算（租约 pending）：409。
+    """
+    row = database.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    code = database.confirm_quota_lease(task_id, payload.reservation_token)
+    if code == "no_lease":
+        raise HTTPException(
+            status_code=404,
+            detail="该任务不存在可确认的预留租约（未启用配额、未成功扣减或配额不足）",
+        )
+    if code == "bad_token":
+        raise HTTPException(status_code=403, detail="reservation_token 不匹配")
+    if code == "pending":
+        raise HTTPException(
+            status_code=409, detail="任务尚未完成配额结算，租约未激活，暂不能确认"
+        )
+
+    lease_row = database.get_quota_lease(task_id)
+    if code in ("ok", "already_confirmed"):
+        return QuotaConfirmOut(
+            task_id=task_id,
+            status="confirmed",
+            already=(code == "already_confirmed"),
+            released=False,
+            expires_at=lease_row["expires_at"] if lease_row else None,
+            confirmed_at=lease_row["confirmed_at"] if lease_row else None,
+            expired_at=None,
+        )
+    # code == "expired"：可能已被回收（status=expired）或仅到期未回收（active）
+    released = (
+        lease_row is not None
+        and lease_row["status"] == database.LEASE_EXPIRED
+    )
+    return QuotaConfirmOut(
+        task_id=task_id,
+        status="expired",
+        already=released,
+        released=released,
+        expires_at=lease_row["expires_at"] if lease_row else None,
+        confirmed_at=None,
+        expired_at=lease_row["expired_at"] if lease_row else None,
+    )
+
+
 @app.post("/api/tasks", response_model=TaskCreated, status_code=201)
 def create_task(payload: ExamTaskIn) -> TaskCreated:
-    """提交组卷任务：题库快照 + 总分/题型/知识点/难度/互斥题组约束。"""
+    """提交组卷任务：题库快照 + 总分/题型/知识点/难度/互斥题组约束。
+
+    声明 ``use_quota=true`` 时，``lease_seconds``（缺省 300 秒）与
+    ``reservation_token``（缺省服务端随机生成）随任务在同一事务登记为
+    pending 预留租约，令牌随创建响应返回。
+    """
+    lease_seconds, token = _lease_from_request(
+        payload.use_quota, payload.lease_seconds, payload.reservation_token
+    )
     req = payload.model_dump()
+    if payload.use_quota:
+        # 落定后的租约参数（含服务端生成的令牌）必须进入冻结请求，
+        # 与 quota_leases 行、created 审计载荷三方锚定
+        req["lease_seconds"] = int(lease_seconds)
+        req["reservation_token"] = token
     task_id = database.create_task(
         payload.name,
         json.dumps(req, ensure_ascii=False),
         payload.seed,
+        lease=(int(lease_seconds), token) if payload.use_quota else None,
     )
     submit(task_id)
+    if payload.use_quota:
+        return TaskCreated(
+            task_id=task_id,
+            status="pending",
+            lease_seconds=int(lease_seconds),
+            reservation_token=token,
+            expires_at=_estimated_expires_at(int(lease_seconds)),
+        )
     return TaskCreated(task_id=task_id, status="pending")
 
 
@@ -190,6 +319,8 @@ def create_task_from_template(
             questions=payload.questions,
             seed=payload.seed,
             use_quota=payload.use_quota,
+            lease_seconds=payload.lease_seconds,
+            reservation_token=payload.reservation_token,
             **merged,
         )
     except ValidationError as exc:
@@ -198,8 +329,17 @@ def create_task_from_template(
             status_code=422, detail=_validation_detail(exc)
         ) from exc
 
+    lease_seconds, token = _lease_from_request(
+        effective.use_quota,
+        effective.lease_seconds,
+        effective.reservation_token,
+    )
     # 冻结实际生效配置与模板溯源信息；kind=template 仅供识别，求解同普通任务
     frozen = effective.model_dump()
+    if effective.use_quota:
+        # 落定后的租约参数（含服务端生成的令牌）进入冻结请求
+        frozen["lease_seconds"] = int(lease_seconds)
+        frozen["reservation_token"] = token
     frozen["kind"] = "template"
     frozen["template_id"] = row["id"]
     frozen["template_version"] = row["version"]
@@ -207,8 +347,19 @@ def create_task_from_template(
         name,
         json.dumps(frozen, ensure_ascii=False),
         payload.seed,
+        lease=(int(lease_seconds), token) if effective.use_quota else None,
     )
     submit(task_id)
+    if effective.use_quota:
+        return TemplateTaskCreated(
+            task_id=task_id,
+            status="pending",
+            template_id=row["id"],
+            template_version=row["version"],
+            lease_seconds=int(lease_seconds),
+            reservation_token=token,
+            expires_at=_estimated_expires_at(int(lease_seconds)),
+        )
     return TemplateTaskCreated(
         task_id=task_id,
         status="pending",
@@ -383,7 +534,8 @@ def get_task(task_id: int) -> TaskStatus:
         template_id = req.get("template_id")
         template_version = req.get("template_version")
 
-    # 启用配额的任务：回显本次预留及剩余次数（未声明 use_quota 的任务不返回该字段）
+    # 启用配额的任务：回显本次预留、剩余次数及预留租约状态/到期时间
+    # （未声明 use_quota 的任务不返回该字段）
     quota_info: Optional[TaskQuotaOut] = None
     if req.get("use_quota"):
         quota_status: Optional[str] = None
@@ -392,8 +544,25 @@ def get_task(task_id: int) -> TaskStatus:
                 quota_status = "exceeded"
             elif result.status == "feasible":
                 quota_status = "reserved"
+
+        lease_row = database.get_quota_lease(task_id)
+        lease_out: Optional[QuotaLeaseOut] = None
+        if lease_row is not None:
+            effective_lease_status = database.lease_effective_status(lease_row)
+            lease_out = QuotaLeaseOut(
+                status=effective_lease_status,
+                lease_seconds=int(lease_row["lease_seconds"]),
+                reservation_token=req.get("reservation_token"),
+                expires_at=lease_row["expires_at"],
+                confirmed_at=lease_row["confirmed_at"],
+                expired_at=lease_row["expired_at"],
+            )
+
         quota_info = TaskQuotaOut(
             status=quota_status,
+            lease_seconds=req.get("lease_seconds"),
+            reservation_token=req.get("reservation_token"),
+            lease=lease_out,
             reservations=[
                 QuotaReservationOut(
                     question_id=json.loads(r["question_id"]),
