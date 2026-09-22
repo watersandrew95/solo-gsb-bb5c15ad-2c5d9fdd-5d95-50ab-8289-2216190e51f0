@@ -1,0 +1,20 @@
+services:
+  exam-api:
+    build: .
+    image: exam-paper-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件路径（容器内路径）；可按需修改
+      EXAM_DB_PATH: /data/exam.db
+    volumes:
+      - exam_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  exam_data:
